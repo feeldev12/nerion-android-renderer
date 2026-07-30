@@ -1,0 +1,292 @@
+name: Renderer Zink/Kopper
+
+# Task A3 (design D1/D3, tasks doc Phase A). Builds our OWN copy of the
+# patched Mesa/Zink "kopper" pair (libEGL_mesa.so + libzink_dri.so) from
+# Swung0x48's Mesa fork, pinned to a specific commit (not floated), using the
+# exact meson flags/build order verified against AngelAuraMC's own real,
+# working `amethyst-prebuilt-libraries` recipe
+# (`renderers/mesa-libs/libs/kopper_zink/`, commit
+# ca883665dae3afeaba80b389d3d70f3ef96c9d82) so this isn't a guessed
+# reconstruction.
+#
+# Pinned Mesa fork commit (verified via GitLab API, gitlab.freedesktop.org
+# project id 25527): 9ea0decb3176d34e578c3c603fd9c8e29b580f71 — its own
+# commit title is "zink: hack through PIPE_CAP_DMABUF", touching
+# src/gallium/drivers/zink/zink_screen.c. This commit itself IS the
+# "one-line zink_kopper.c patch" referenced in the design doc's shorthand —
+# Swung0x48's fork = upstream Mesa + this one patch commit, not a separate
+# patch we apply on top ourselves.
+#
+# Build order (matches AngelAuraMC's real recipe, not reinvented):
+#   1. libdrm, static, per ABI (meson needs it to satisfy zink's DRM dep;
+#      there is no libdrm.pc for the Android cross target, so -Dgallium-
+#      drivers=zink + -Degl=enabled needs `-Dallow-fallback-for=libdrm`-
+#      equivalent handling — AngelAuraMC's recipe instead pre-builds libdrm
+#      as a static lib per ABI and points meson's pkg-config lookup at its
+#      install prefix via PKG_CONFIG_LIBDIR).
+#   2. libcutils.so, per ABI (AngelAuraMC's own minimal rebuild — see
+#      vendor/angelauramc/README.md for the exact 2 AOSP source files and
+#      their Apache-2.0 license; NOT vendored here, we build our own copy
+#      from the same AOSP source, so this one file is build-time-produced
+#      rather than vendored — kept as a vendored binary for the OTHER 3 ABIs
+#      only where we don't have a vendor-quad entry).
+#   3. Mesa itself, per ABI, with the meson flags below.
+#
+# NOTE ON ABI SCOPE: this workflow's build matrix covers all 4 ABIs (matches
+# AngelAuraMC's own recipe and this design's stated intent), but the
+# packaging job only emits a final .tar.xz for ABIs that ALSO have a
+# vendor/angelauramc/<abi>/ directory with all 4 vendored files present.
+# Today that is arm64-v8a only (see vendor/angelauramc/README.md for why) —
+# the other 3 ABIs' Mesa/Zink build output is still produced and uploaded as
+# a CI artifact so no work is lost, but no packaged bundle is emitted until
+# their vendor quad is added in a follow-up.
+#
+# LICENSING GATE (task A2 — see vendor/angelauramc/README.md for full
+# research): this workflow deliberately has NO release-publish job yet.
+# 3 of 4 vendored binaries are confirmed clear (MIT / Apache-2.0 / LGPL-2+);
+# libglxshim.so (Swung0x48/GLXShim) has no declared license at all and is a
+# genuine human decision, not resolved here. Do not add a
+# softprops/action-gh-release step until that gate clears.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/renderer-zink-kopper.yml'
+      - 'vendor/angelauramc/**'
+
+env:
+  MESA_REPO: Swung0x48/mesa
+  MESA_HOST: gitlab.freedesktop.org
+  MESA_REF: 9ea0decb3176d34e578c3c603fd9c8e29b580f71
+  LIBDRM_REPO: mesa/libdrm
+  LIBDRM_HOST: gitlab.freedesktop.org
+  LIBDRM_REF: 76a1e97a9a7c29fa3035bb370d654791bdc23d90
+  ANDROID_NDK_VERSION: r27
+  SDK_VER: 26
+
+jobs:
+  build:
+    name: "Build Mesa/Zink (${{ matrix.abi }})"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            triple: aarch64-linux-android
+            cpu_family: aarch64
+            cpu: armv8
+          - abi: armeabi-v7a
+            triple: armv7a-linux-androideabi
+            cpu_family: arm
+            cpu: armv7a
+          - abi: x86
+            triple: i686-linux-android
+            cpu_family: x86
+            cpu: i686
+          - abi: x86_64
+            triple: x86_64-linux-android
+            cpu_family: x86_64
+            cpu: x86_64
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Mesa (pinned commit, real upstream on GitLab)
+        run: |
+          set -euo pipefail
+          git clone "https://${MESA_HOST}/${MESA_REPO}.git" mesa
+          cd mesa
+          git fetch --depth 1 origin "$MESA_REF"
+          git checkout "$MESA_REF"
+
+      - name: Checkout libdrm (pinned commit)
+        run: |
+          set -euo pipefail
+          git clone "https://${LIBDRM_HOST}/${LIBDRM_REPO}.git" libdrm
+          cd libdrm
+          git fetch --depth 1 origin "$LIBDRM_REF"
+          git checkout "$LIBDRM_REF"
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ninja-build python3-mako python3-pip pkg-config unzip bison flex zlib1g-dev ccache
+          pip3 install --user 'meson>=1.5,<2'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Android NDK ${{ env.ANDROID_NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -L --retry 4 -f --retry-all-errors --retry-delay 30 \
+            -o "$RUNNER_TEMP/ndk.zip" \
+            "https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          echo "NDK_HOME=$RUNNER_TEMP/android-ndk-${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build static libdrm for ${{ matrix.abi }}
+        # Static, minimal (all hardware-specific backends disabled) — matches
+        # AngelAuraMC's own build_libdrm-static_builddirs.sh exactly. This is
+        # only a build-time dependency for Mesa's meson config below, never
+        # itself shipped as a runtime .so.
+        run: |
+          set -euo pipefail
+          toolchain="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sysroot="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          drm_prefix="$RUNNER_TEMP/libdrm-install-${{ matrix.abi }}"
+          cross="$RUNNER_TEMP/libdrm-cross-${{ matrix.abi }}.txt"
+          cat > "$cross" <<EOF
+          [binaries]
+          ar = '$toolchain/llvm-ar'
+          c = ['ccache', '$toolchain/${{ matrix.triple }}${SDK_VER}-clang', '-fPIC', '--sysroot=$sysroot']
+          cpp = ['ccache', '$toolchain/${{ matrix.triple }}${SDK_VER}-clang++', '-fPIC', '-fno-exceptions', '-static-libstdc++', '--sysroot=$sysroot']
+          strip = '$toolchain/llvm-strip'
+          pkgconfig = 'pkg-config'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = '${{ matrix.cpu_family }}'
+          cpu = '${{ matrix.cpu }}'
+          endian = 'little'
+          EOF
+          meson setup libdrm "build-libdrm-${{ matrix.abi }}" \
+            --prefix "$drm_prefix" \
+            --cross-file "$cross" \
+            -Ddefault_library=static \
+            -Dintel=disabled -Dradeon=disabled -Damdgpu=disabled \
+            -Dnouveau=disabled -Dvmwgfx=disabled -Dfreedreno=disabled \
+            -Dvc4=disabled -Detnaviv=disabled -Dcairo-tests=disabled \
+            -Dfreedreno-kgsl=false
+          ninja -C "build-libdrm-${{ matrix.abi }}" install
+          echo "DRM_PREFIX=$drm_prefix" >> "$GITHUB_ENV"
+
+      - name: Configure Mesa (Zink gallium driver, Android EGL platform, kopper)
+        # Flags verified against AngelAuraMC's own build_zink_builddirs.sh —
+        # not reinvented. -Degl-lib-suffix=_mesa is what makes the output
+        # libEGL_mesa.so instead of colliding with the device's system
+        # libEGL.so.
+        run: |
+          set -euo pipefail
+          toolchain="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sysroot="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          cross="$RUNNER_TEMP/mesa-cross-${{ matrix.abi }}.txt"
+          cat > "$cross" <<EOF
+          [binaries]
+          ar = '$toolchain/llvm-ar'
+          c = ['ccache', '$toolchain/${{ matrix.triple }}${SDK_VER}-clang', '-fPIC', '--sysroot=$sysroot']
+          cpp = ['ccache', '$toolchain/${{ matrix.triple }}${SDK_VER}-clang++', '-fPIC', '-fno-exceptions', '-static-libstdc++', '--sysroot=$sysroot']
+          strip = '$toolchain/llvm-strip'
+          pkgconfig = ['env', 'PKG_CONFIG_LIBDIR=${{ env.DRM_PREFIX }}/lib/pkgconfig', 'pkg-config']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = '${{ matrix.cpu_family }}'
+          cpu = '${{ matrix.cpu }}'
+          endian = 'little'
+          EOF
+          meson setup mesa "build-mesa-${{ matrix.abi }}" \
+            --prefix "$GITHUB_WORKSPACE/mesa-install-${{ matrix.abi }}" \
+            --cross-file "$cross" \
+            --buildtype release \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=${SDK_VER} \
+            -Dandroid-stub=true \
+            -Dxlib-lease=disabled \
+            -Degl=enabled \
+            -Dgbm=disabled \
+            -Dglx=disabled \
+            -Dllvm=disabled \
+            -Dopengl=true \
+            -Dvulkan-drivers= \
+            -Dgallium-drivers=zink \
+            -Dzstd=disabled \
+            -Dglvnd=false \
+            -Degl-lib-suffix=_mesa
+
+      - name: Build and install
+        run: ninja -C "build-mesa-${{ matrix.abi }}" install
+
+      - name: Collect our own build output (libEGL_mesa.so + libzink_dri.so)
+        run: |
+          set -euo pipefail
+          out="patched-mesa/${{ matrix.abi }}"
+          mkdir -p "$out"
+          find "mesa-install-${{ matrix.abi }}/lib" -maxdepth 1 \
+            \( -name 'libEGL_mesa.so' -o -name '*zink_dri.so' \) \
+            -exec cp -v {} "$out/" \;
+          ls -la "$out"
+
+      - name: Upload patched Mesa/Zink pair (${{ matrix.abi }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: "patched-mesa-${{ matrix.abi }}"
+          path: patched-mesa/${{ matrix.abi }}
+
+  package:
+    name: Package renderer bundle (patched pair + vendored quad)
+    needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+    steps:
+      - name: Checkout this repo (for vendor/angelauramc)
+        uses: actions/checkout@v4
+
+      - name: Download patched Mesa/Zink pair (${{ matrix.abi }})
+        uses: actions/download-artifact@v4
+        with:
+          name: "patched-mesa-${{ matrix.abi }}"
+          path: "bundle/${{ matrix.abi }}"
+
+      - name: Skip if this ABI has no vendored quad yet
+        id: gate
+        run: |
+          vendor_dir="vendor/angelauramc/${{ matrix.abi }}"
+          if [ -f "$vendor_dir/libglapi.so" ] && [ -f "$vendor_dir/libcutils.so" ] && \
+             [ -f "$vendor_dir/libglxshim.so" ] && [ -f "$vendor_dir/libopenal.so" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No vendored quad for ${{ matrix.abi }} yet (see vendor/angelauramc/README.md) — skipping packaging for this ABI."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assemble the 6-file bundle
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          cp "vendor/angelauramc/${{ matrix.abi }}/"*.so "bundle/${{ matrix.abi }}/"
+          ls -la "bundle/${{ matrix.abi }}"
+          count=$(find "bundle/${{ matrix.abi }}" -name '*.so' | wc -l)
+          if [ "$count" -ne 6 ]; then
+            echo "::error::Expected 6 .so files in bundle/${{ matrix.abi }}, found $count"
+            exit 1
+          fi
+
+      - name: Archive + sha256
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          archive="renderer-zink-kopper-${{ matrix.abi }}.tar.xz"
+          tar -C "bundle/${{ matrix.abi }}" -cJf "$archive" .
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Upload packaged bundle (${{ matrix.abi }})
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "renderer-bundle-${{ matrix.abi }}"
+          path: |
+            renderer-zink-kopper-${{ matrix.abi }}.tar.xz
+            renderer-zink-kopper-${{ matrix.abi }}.tar.xz.sha256
+
+  # NOTE (task A4 — deliberately NOT implemented yet): a "publish-release"
+  # job belongs here once task A2's licensing gate clears for
+  # libglxshim.so — see vendor/angelauramc/README.md. It would mirror
+  # nerion-android-jdk-build's jre21-android.yml publish-manifest job
+  # (softprops/action-gh-release, in-repo GITHUB_TOKEN, stable tag). Adding
+  # it now would let anyone run workflow_dispatch and accidentally publish a
+  # public Release containing an unlicensed third-party binary.
