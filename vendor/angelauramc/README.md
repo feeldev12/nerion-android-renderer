@@ -69,31 +69,25 @@ API + raw source, not guessed):
    upstream source revision AngelAuraMC built from, to fully satisfy LGPL's
    source-correspondence expectation for the library itself (not our app).
 
-4. **`libglxshim.so` — STILL BLOCKS THE FIRST RELEASE. Genuinely unresolved,
-   needs a human call.** `Swung0x48/GLXShim` has **no LICENSE file and no
-   README at all** (confirmed via `gh api repos/Swung0x48/GLXShim` — GitHub's
-   own license field is `null`, and `contents` listing shows only
-   `build.gradle.kts` + `src/`; the `/readme` endpoint 404s, meaning there is
-   no README to even carry an informal license statement). Under default
-   copyright law, no license means no redistribution rights are actually
-   granted, regardless of how small or widely-reused the utility is —
-   AngelAuraMC's own README lists it as "Unknown License" too, i.e. they are
-   in exactly the same unresolved position we are, not a project that solved
-   this. This is a **real legal gap**, not a technicality. Options for a
-   human to choose between (not decided here):
-   - Ship it anyway on the reasoning that it's a tiny (~one file),
-     already-widely-redistributed-by-the-entire-Amethyst/Pojav-lineage
-     utility with no known objection ever raised by its author — accept the
-     residual risk.
-   - Reach out to Swung0x48 directly and ask for explicit permission /a
-     LICENSE grant (e.g. open an issue on their repo).
-   - Write an original from-scratch replacement implementing the same
-     `glXGetProcAddress`-reads-`POJAVEXEC_EGL`-and-`dlopen`s pattern (the
-     pattern itself is not copyrightable, only Swung0x48's actual expression
-     of it is) — mirrors exactly what this project's own
-     `tools/android-glfw-shim/src/glfw_shim.c` already did for PojavLauncher's
-     GPLv3 native bridge, for the same reason.
+4. **`libglxshim.so` — RESOLVED, human decision made.** `Swung0x48/GLXShim`
+   has **no LICENSE file and no README at all** (confirmed via
+   `gh api repos/Swung0x48/GLXShim` — GitHub's own license field is `null`,
+   and `contents` listing shows only `build.gradle.kts` + `src/`; the
+   `/readme` endpoint 404s, meaning there is no README to even carry an
+   informal license statement). Under default copyright law, no license
+   means no redistribution rights are formally granted, regardless of how
+   small or widely-reused the utility is — AngelAuraMC's own README lists it
+   as "Unknown License" too, i.e. they are in exactly the same unresolved
+   position we are, not a project that solved this.
+   **Decision (project maintainer, task A2): ship it anyway.** Rationale:
+   it's a tiny (~one file), already-widely-redistributed-by-the-entire-
+   Amethyst/Pojav-lineage utility with no known objection ever raised by its
+   author — the residual risk is accepted, matching existing ecosystem
+   precedent. The alternatives (asking Swung0x48 for an explicit grant, or
+   writing an original from-scratch replacement mirroring this project's own
+   `tools/android-glfw-shim/src/glfw_shim.c`, which did exactly that for
+   PojavLauncher's GPLv3 native bridge) were considered and not pursued.
 
-**Until item 4 is resolved, task A4 (cut the first public Release) MUST NOT
-run** — see this repo's workflow, which stops at artifact upload and does not
-publish a Release.
+**Task A4 (cut the first public Release) is unblocked** — see this repo's
+workflow, whose `publish-release` job now runs after `package` and publishes
+the packaged bundle(s) to a stable public GitHub Release.

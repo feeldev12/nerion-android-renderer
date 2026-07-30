@@ -42,11 +42,13 @@ name: Renderer Zink/Kopper
 # their vendor quad is added in a follow-up.
 #
 # LICENSING GATE (task A2 — see vendor/angelauramc/README.md for full
-# research): this workflow deliberately has NO release-publish job yet.
-# 3 of 4 vendored binaries are confirmed clear (MIT / Apache-2.0 / LGPL-2+);
-# libglxshim.so (Swung0x48/GLXShim) has no declared license at all and is a
-# genuine human decision, not resolved here. Do not add a
-# softprops/action-gh-release step until that gate clears.
+# research): 3 of 4 vendored binaries were confirmed clear (MIT / Apache-2.0
+# / LGPL-2+); libglxshim.so (Swung0x48/GLXShim) has no declared license at
+# all and required a genuine human decision. RESOLVED: ship it anyway,
+# accepting the residual risk, matching existing Amethyst/Pojav-lineage
+# precedent (see vendor/angelauramc/README.md item 4 for the full
+# rationale). Task A4 is unblocked — the publish-release job below now
+# publishes the packaged bundle(s) to a stable public GitHub Release.
 
 on:
   workflow_dispatch:
@@ -54,6 +56,9 @@ on:
     paths:
       - '.github/workflows/renderer-zink-kopper.yml'
       - 'vendor/angelauramc/**'
+
+permissions:
+  contents: write
 
 env:
   MESA_REPO: Swung0x48/mesa
@@ -64,6 +69,7 @@ env:
   LIBDRM_REF: 76a1e97a9a7c29fa3035bb370d654791bdc23d90
   ANDROID_NDK_VERSION: r27
   SDK_VER: 26
+  RELEASE_TAG: renderer-zink-kopper
 
 jobs:
   build:
@@ -293,10 +299,55 @@ jobs:
             renderer-zink-kopper-${{ matrix.abi }}.tar.xz
             renderer-zink-kopper-${{ matrix.abi }}.tar.xz.sha256
 
-  # NOTE (task A4 — deliberately NOT implemented yet): a "publish-release"
-  # job belongs here once task A2's licensing gate clears for
-  # libglxshim.so — see vendor/angelauramc/README.md. It would mirror
-  # nerion-android-jdk-build's jre21-android.yml publish-manifest job
-  # (softprops/action-gh-release, in-repo GITHUB_TOKEN, stable tag). Adding
-  # it now would let anyone run workflow_dispatch and accidentally publish a
-  # public Release containing an unlicensed third-party binary.
+  publish-release:
+    name: Publish renderer bundle Release
+    needs: package
+    runs-on: ubuntu-22.04
+    # Task A4. Mirrors nerion-android-jdk-build's jre21-android.yml
+    # publish-manifest job: in-repo publish using this repo's own
+    # GITHUB_TOKEN (permissions: contents: write, set at workflow level
+    # above), no cross-repo token/secret needed. Re-running this job
+    # re-uploads to the SAME tag, replacing assets in place
+    # (softprops/action-gh-release updates an existing release's assets
+    # rather than failing on tag collision).
+    #
+    # Only ABIs whose `package` job actually produced a bundle are
+    # published — today that is arm64-v8a only (see
+    # vendor/angelauramc/README.md "Current ABI coverage"). The other 3
+    # ABIs' Mesa/Zink build output still exists as a CI artifact
+    # (patched-mesa-<abi>) but is not part of this Release until their
+    # vendor quad is added in a follow-up.
+    steps:
+      - name: Download all packaged renderer bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'renderer-bundle-*'
+          path: bundles
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -la bundles
+
+      - name: Publish renderer bundles to a stable public GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Renderer (Mesa/Zink Kopper + AngelAuraMC vendor quad)"
+          body: |
+            Per-ABI renderer bundles: our own patched Mesa/Zink "kopper" pair
+            (`libEGL_mesa.so` + `libzink_dri.so`, built by this repo's own
+            `.github/workflows/renderer-zink-kopper.yml`, run
+            ${{ github.run_id }}) plus the vendored AngelAuraMC quad
+            (`libglapi.so`, `libcutils.so`, `libglxshim.so`, `libopenal.so`
+            — see `vendor/angelauramc/README.md` for full provenance and
+            licensing notes, including the accepted-risk decision for
+            `libglxshim.so`).
+
+            Only ABIs with a published archive below have a complete
+            vendored quad today (see `vendor/angelauramc/README.md`,
+            "Current ABI coverage").
+          draft: false
+          prerelease: false
+          files: |
+            bundles/*.tar.xz
+            bundles/*.tar.xz.sha256
