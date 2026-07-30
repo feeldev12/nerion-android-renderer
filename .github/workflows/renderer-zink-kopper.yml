@@ -68,7 +68,18 @@ env:
   LIBDRM_HOST: gitlab.freedesktop.org
   LIBDRM_REF: 76a1e97a9a7c29fa3035bb370d654791bdc23d90
   ANDROID_NDK_VERSION: r27
-  SDK_VER: 26
+  # BUGFIX (real-device crash, android-renderer-provisioning Phase E2):
+  # NDK Clang defaults to emulated TLS (-femulated-tls) for target API <29
+  # and real ELF TLS for API >=29. AngelAuraMC's vendored libglapi.so (see
+  # vendor/angelauramc/) was built against real ELF TLS -- it exports
+  # `_glapi_tls_Context` as a genuine TLS symbol, not `__emutls_v._glapi_tls_Context`.
+  # Building our own Mesa/Zink at SDK_VER=26 made libzink_dri.so require the
+  # emulated-TLS symbol name instead, which doesn't exist anywhere in the
+  # loaded library set -- confirmed on-device via `llvm-readelf --dyn-syms`
+  # on both .so files, and via the real crash: `dlopen failed: cannot locate
+  # symbol "__emutls_v._glapi_tls_Context"`. Raising this to 29 makes our own
+  # Mesa build use the same real-TLS ABI as the vendored glapi.
+  SDK_VER: 29
   RELEASE_TAG: renderer-zink-kopper
 
 jobs:
