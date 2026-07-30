@@ -209,13 +209,23 @@ jobs:
         run: ninja -C "build-mesa-${{ matrix.abi }}" install
 
       - name: Collect our own build output (libEGL_mesa.so + libzink_dri.so)
+        # BUGFIX (first real CI run, this session): Mesa's meson install step
+        # places the gallium/zink driver at lib/dri/zink_dri.so (no "lib"
+        # prefix, nested one level under lib/), NOT directly in lib/ next to
+        # libEGL_mesa.so — confirmed via this workflow's own real "Build and
+        # install" step log ("Installing src/gallium/targets/dri/
+        # libgallium_dri.so to .../lib/dri/zink_dri.so"). A `find` with
+        # `-maxdepth 1` on lib/ alone missed it entirely, so the package job
+        # only ever saw 5 of the 6 expected files. Also renamed to the
+        # lib-prefixed name here (jniLibs packaging requires it — see this
+        # repo's README naming note; Mesa's own raw install output is
+        # `zink_dri.so`, without the prefix).
         run: |
           set -euo pipefail
           out="patched-mesa/${{ matrix.abi }}"
           mkdir -p "$out"
-          find "mesa-install-${{ matrix.abi }}/lib" -maxdepth 1 \
-            \( -name 'libEGL_mesa.so' -o -name '*zink_dri.so' \) \
-            -exec cp -v {} "$out/" \;
+          cp -v "mesa-install-${{ matrix.abi }}/lib/libEGL_mesa.so" "$out/"
+          cp -v "mesa-install-${{ matrix.abi }}/lib/dri/zink_dri.so" "$out/libzink_dri.so"
           ls -la "$out"
 
       - name: Upload patched Mesa/Zink pair (${{ matrix.abi }})
