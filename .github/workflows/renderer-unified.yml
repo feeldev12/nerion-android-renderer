@@ -1,0 +1,139 @@
+name: Renderer Unified
+
+# Publishes the "unified" renderer bundle the launcher fetches
+# (src-tauri/gen/android/app/renderer.properties → renderer.tag).
+#
+# v1 (renderer-unified-v1) was assembled by hand: the 6-file Zink Kopper
+# bundle from renderer-zink-kopper.yml plus GL4ES/Krypton, ANGLE, MobileGlues
+# and Turnip Freedreno. v2 = that exact v1 archive (sha256-checked, not
+# rebuilt) + libltw.so built here from a pinned MojoLauncher/LTW commit — see
+# vendor/ltw/README.md for provenance and LGPL-3.0 notes.
+#
+# The archive must hold ONLY .so files: the launcher's fetchRendererLibs task
+# extracts it straight into jniLibs/<abi>/. License texts are published as
+# separate Release assets instead.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/renderer-unified.yml'
+      - 'vendor/ltw/**'
+
+permissions:
+  contents: write
+
+env:
+  LTW_REPO: MojoLauncher/LTW
+  LTW_REF: 11f1b36f701e69731d685e94c6788e60d829ea35
+  BASE_TAG: renderer-unified-v1
+  RELEASE_TAG: renderer-unified-v2
+  ABI: arm64-v8a
+
+jobs:
+  package:
+    name: Build LTW + package unified bundle (arm64-v8a)
+    # Same runner as upstream LTW's own CI, which resolves its pinned NDK
+    # (28.2.13676358) from the preinstalled Android SDK.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout LTW (pinned commit)
+        run: |
+          set -euo pipefail
+          git clone "https://github.com/${LTW_REPO}.git" ltw-src
+          git -C ltw-src checkout "$LTW_REF"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build LTW (upstream recipe)
+        working-directory: ltw-src
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :ltw:assembleRelease
+
+      - name: Fetch the v1 bundle and verify its sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="renderer-unified-${ABI}.tar.xz"
+          gh release download "$BASE_TAG" -R "$GITHUB_REPOSITORY" -D base \
+            -p "$archive" -p "$archive.sha256"
+          expected=$(awk '{print $1}' "base/$archive.sha256")
+          actual=$(sha256sum "base/$archive" | awk '{print $1}')
+          [ "$expected" = "$actual" ] || { echo "::error::sha256 mismatch for $BASE_TAG/$archive"; exit 1; }
+          mkdir -p "bundle/$ABI"
+          tar -xJf "base/$archive" -C "bundle/$ABI"
+
+      - name: Add libltw.so
+        run: |
+          set -euo pipefail
+          unzip -j ltw-src/ltw/build/outputs/aar/ltw-release.aar "jni/${ABI}/libltw.so" -d "bundle/$ABI"
+          ls -la "bundle/$ABI"
+
+      - name: Check the bundle is exactly the 13 expected libraries
+        run: |
+          set -euo pipefail
+          expected="libEGL_angle.so libEGL_mesa.so libGLESv2_angle.so libcutils.so libgl4es_115.so
+                    libglapi.so libglxshim.so libltw.so libmobileglues.so libng_gl4es.so
+                    libopenal.so libvulkan_freedreno.so libzink_dri.so"
+          diff <(echo $expected | tr ' ' '\n' | sort) <(ls "bundle/$ABI" | sort) \
+            || { echo "::error::bundle/$ABI doesn't match the expected file list"; exit 1; }
+
+      - name: Archive + sha256
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          archive="renderer-unified-${ABI}.tar.xz"
+          tar -C "bundle/$ABI" -cJf "dist/$archive" .
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
+          cp vendor/ltw/LICENSE-LGPL-3.0-ltw.txt dist/
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: renderer-unified-${{ env.ABI }}
+          path: dist/
+
+  publish-release:
+    name: Publish unified bundle Release
+    needs: package
+    # Branch pushes only validate the build; publishing happens from main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: renderer-unified-${{ env.ABI }}
+          path: dist
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: "Unified Android Renderers v2 (+ LTW)"
+          body: |
+            Unified renderer bundle for arm64-v8a: everything in
+            `${{ env.BASE_TAG }}` (Zink Kopper, GL4ES/Krypton, ANGLE,
+            MobileGlues, Turnip Freedreno), unchanged, plus `libltw.so`.
+
+            `libltw.so` is LTW (Large Thin Wrapper), LGPL-3.0, built
+            unmodified from https://github.com/${{ env.LTW_REPO }}/tree/${{ env.LTW_REF }}
+            by `.github/workflows/renderer-unified.yml` (run ${{ github.run_id }}).
+            License text: `LICENSE-LGPL-3.0-ltw.txt` below. Provenance and
+            licensing notes: `vendor/ltw/README.md`.
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.tar.xz
+            dist/*.tar.xz.sha256
+            dist/LICENSE-LGPL-3.0-ltw.txt

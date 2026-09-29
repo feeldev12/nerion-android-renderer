@@ -20,6 +20,13 @@ A per-ABI `.tar.xz` (+ `.sha256`) containing exactly 6 shared libraries:
   unmodified prebuilt binaries (`vendor/angelauramc/<abi>/`) — see that
   directory's own README for full provenance and licensing research.
 
+## Unified bundle (what the launcher fetches today)
+
+`renderer-unified-v*` Releases carry every renderer the launcher loads, in one
+`renderer-unified-<abi>.tar.xz`. v1 was assembled by hand; v2 is produced by
+`.github/workflows/renderer-unified.yml` = v1 unchanged + `libltw.so` built
+from a pinned `MojoLauncher/LTW` commit (see `vendor/ltw/README.md`, LGPL-3.0).
+
 ## Status
 
 - ABI coverage: `arm64-v8a` only for the vendored quad right now (build
