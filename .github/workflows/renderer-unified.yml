@@ -5,9 +5,24 @@ name: Renderer Unified
 #
 # v1 (renderer-unified-v1) was assembled by hand: the 6-file Zink Kopper
 # bundle from renderer-zink-kopper.yml plus GL4ES/Krypton, ANGLE, MobileGlues
-# and Turnip Freedreno. v2 = that exact v1 archive (sha256-checked, not
-# rebuilt) + libltw.so built here from a pinned MojoLauncher/LTW commit — see
-# vendor/ltw/README.md for provenance and LGPL-3.0 notes.
+# and Turnip Freedreno. v2 = v1 + libltw.so built from a pinned
+# MojoLauncher/LTW commit (vendor/ltw/README.md).
+#
+# v3 = v2 with the 7 libraries that were linked for 4 KB pages rebuilt for
+# 16 KB pages — Google Play rejects the bundle otherwise ("Tu app no admite
+# tamaños de página de 16 KB", versionCode 1076). Same sources, same
+# compilers, only the page alignment changes:
+#   - libEGL_mesa.so, libzink_dri.so: renderer-zink-kopper.yml's Mesa build
+#     (same Mesa/libdrm commits, NDK r27, API 29) plus max-page-size=16384.
+#   - libgl4es_115.so, libng_gl4es.so, libmobileglues.so, libglxshim.so,
+#     libcutils.so: built by AngelAuraMC/amethyst-prebuilt-libraries' own
+#     recipes (its Gradle modules / build_libcutils.sh) at the commit the v1
+#     binaries came from — confirmed from the build paths and version stamps
+#     inside them (HolyGL4ES 1.1.5, Krypton Wrapper 0.4.5, MobileGlues 1.3.4)
+#     — with the NDK's flexible page size switch on.
+# The other 6 (ANGLE, Turnip, glapi, OpenAL, LTW) already were 16 KB and are
+# copied from v2 unchanged. Every .so in the archive is checked by
+# scripts/check_page_align.py before it is published.
 #
 # The archive must hold ONLY .so files: the launcher's fetchRendererLibs task
 # extracts it straight into jniLibs/<abi>/. License texts are published as
@@ -18,47 +33,281 @@ on:
   push:
     paths:
       - '.github/workflows/renderer-unified.yml'
+      - 'scripts/check_page_align.py'
       - 'vendor/ltw/**'
 
 permissions:
   contents: write
 
 env:
-  LTW_REPO: MojoLauncher/LTW
-  LTW_REF: 11f1b36f701e69731d685e94c6788e60d829ea35
-  BASE_TAG: renderer-unified-v1
-  RELEASE_TAG: renderer-unified-v2
   ABI: arm64-v8a
+  BASE_TAG: renderer-unified-v2
+  RELEASE_TAG: renderer-unified-v3
+  # Same pins as renderer-zink-kopper.yml (see its comments for SDK_VER=29).
+  MESA_REPO: Swung0x48/mesa
+  MESA_HOST: gitlab.freedesktop.org
+  MESA_REF: 9ea0decb3176d34e578c3c603fd9c8e29b580f71
+  LIBDRM_REPO: mesa/libdrm
+  LIBDRM_HOST: gitlab.freedesktop.org
+  LIBDRM_REF: 76a1e97a9a7c29fa3035bb370d654791bdc23d90
+  ANDROID_NDK_VERSION: r27
+  SDK_VER: 29
+  # AngelAuraMC/amethyst-prebuilt-libraries and the submodule commits it pins
+  # there (checked below, so a moved pin fails instead of silently changing a
+  # renderer).
+  AMETHYST_REPO: AngelAuraMC/amethyst-prebuilt-libraries
+  AMETHYST_REF: ca883665dae3afeaba80b389d3d70f3ef96c9d82
+  HOLYGL4ES_REF: beada3754693ec0cd492a1580d320474657918d8
+  KRYPTON_REF: 6e153a1622a8d9ef903f7975aafbef2453571bab
+  MOBILEGLUES_REF: 311b9e5ad1e4556dbdf15173e001aed9411bf977
+  GLXSHIM_REF: 39b93b5af6ffe1c278f33bbb3fb4436fca270843
+  # The NDKs the v1 binaries were linked with (clang 18.0.1 / 18.0.4).
+  GLXSHIM_NDK: 27.0.12077973
+  CUTILS_NDK: 27.2.12479018
+  PAGE_LDFLAG: -Wl,-z,max-page-size=16384
 
 jobs:
-  package:
-    name: Build LTW + package unified bundle (arm64-v8a)
-    # Same runner as upstream LTW's own CI, which resolves its pinned NDK
-    # (28.2.13676358) from the preinstalled Android SDK.
+  mesa:
+    name: Build Mesa/Zink for 16 KB pages (arm64-v8a)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Mesa and libdrm (pinned commits)
+        run: |
+          set -euo pipefail
+          git clone "https://${MESA_HOST}/${MESA_REPO}.git" mesa
+          git -C mesa fetch --depth 1 origin "$MESA_REF"
+          git -C mesa checkout "$MESA_REF"
+          git clone "https://${LIBDRM_HOST}/${LIBDRM_REPO}.git" libdrm
+          git -C libdrm fetch --depth 1 origin "$LIBDRM_REF"
+          git -C libdrm checkout "$LIBDRM_REF"
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ninja-build python3-mako python3-pip pkg-config unzip bison flex zlib1g-dev ccache
+          pip3 install --user 'meson>=1.5,<2'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Android NDK ${{ env.ANDROID_NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -L --retry 4 -f --retry-all-errors --retry-delay 30 \
+            -o "$RUNNER_TEMP/ndk.zip" \
+            "https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          echo "NDK_HOME=$RUNNER_TEMP/android-ndk-${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build static libdrm
+        run: |
+          set -euo pipefail
+          toolchain="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sysroot="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          drm_prefix="$RUNNER_TEMP/libdrm-install"
+          cross="$RUNNER_TEMP/libdrm-cross.txt"
+          cat > "$cross" <<EOF
+          [binaries]
+          ar = '$toolchain/llvm-ar'
+          c = ['ccache', '$toolchain/aarch64-linux-android${SDK_VER}-clang', '-fPIC', '--sysroot=$sysroot']
+          cpp = ['ccache', '$toolchain/aarch64-linux-android${SDK_VER}-clang++', '-fPIC', '-fno-exceptions', '-static-libstdc++', '--sysroot=$sysroot']
+          strip = '$toolchain/llvm-strip'
+          pkgconfig = 'pkg-config'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+          meson setup libdrm build-libdrm \
+            --prefix "$drm_prefix" \
+            --cross-file "$cross" \
+            -Ddefault_library=static \
+            -Dintel=disabled -Dradeon=disabled -Damdgpu=disabled \
+            -Dnouveau=disabled -Dvmwgfx=disabled -Dfreedreno=disabled \
+            -Dvc4=disabled -Detnaviv=disabled -Dcairo-tests=disabled \
+            -Dfreedreno-kgsl=false
+          ninja -C build-libdrm install
+          echo "DRM_PREFIX=$drm_prefix" >> "$GITHUB_ENV"
+
+      - name: Configure Mesa (same options as renderer-zink-kopper.yml + 16 KB pages)
+        run: |
+          set -euo pipefail
+          toolchain="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sysroot="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          cross="$RUNNER_TEMP/mesa-cross.txt"
+          cat > "$cross" <<EOF
+          [binaries]
+          ar = '$toolchain/llvm-ar'
+          c = ['ccache', '$toolchain/aarch64-linux-android${SDK_VER}-clang', '-fPIC', '--sysroot=$sysroot']
+          cpp = ['ccache', '$toolchain/aarch64-linux-android${SDK_VER}-clang++', '-fPIC', '-fno-exceptions', '-static-libstdc++', '--sysroot=$sysroot']
+          strip = '$toolchain/llvm-strip'
+          pkgconfig = ['env', 'PKG_CONFIG_LIBDIR=${{ env.DRM_PREFIX }}/lib/pkgconfig', 'pkg-config']
+
+          [built-in options]
+          c_link_args = ['${PAGE_LDFLAG}']
+          cpp_link_args = ['${PAGE_LDFLAG}']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+          meson setup mesa build-mesa \
+            --prefix "$GITHUB_WORKSPACE/mesa-install" \
+            --cross-file "$cross" \
+            --buildtype release \
+            -Dplatforms=android \
+            -Dplatform-sdk-version=${SDK_VER} \
+            -Dandroid-stub=true \
+            -Dxlib-lease=disabled \
+            -Degl=enabled \
+            -Dgbm=disabled \
+            -Dglx=disabled \
+            -Dllvm=disabled \
+            -Dopengl=true \
+            -Dvulkan-drivers= \
+            -Dgallium-drivers=zink \
+            -Dzstd=disabled \
+            -Dglvnd=false \
+            -Degl-lib-suffix=_mesa
+
+      - name: Build and install
+        run: ninja -C build-mesa install
+
+      - name: Collect libEGL_mesa.so + libzink_dri.so
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp -v mesa-install/lib/libEGL_mesa.so out/
+          cp -v mesa-install/lib/dri/zink_dri.so out/libzink_dri.so
+          python3 scripts/check_page_align.py out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rebuilt-mesa
+          path: out/
+
+  amethyst:
+    name: Build GL4ES/Krypton/MobileGlues/GLXShim/cutils for 16 KB pages (arm64-v8a)
+    # Same runner image as AngelAuraMC's own CI for these modules.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Checkout LTW (pinned commit)
+      - name: Checkout amethyst-prebuilt-libraries + the 4 submodules we rebuild
         run: |
           set -euo pipefail
-          git clone "https://github.com/${LTW_REPO}.git" ltw-src
-          git -C ltw-src checkout "$LTW_REF"
+          export GIT_LFS_SKIP_SMUDGE=1
+          git init -q amethyst
+          git -C amethyst fetch --depth 1 "https://github.com/${AMETHYST_REPO}.git" "$AMETHYST_REF"
+          git -C amethyst checkout -q FETCH_HEAD
+          check_pin() {
+            actual=$(git -C amethyst ls-tree HEAD "$1" | awk '{print $3}')
+            [ "$actual" = "$2" ] || { echo "::error::$1 is pinned to $actual, expected $2"; exit 1; }
+          }
+          check_pin renderers/HolyGL4ES/HolyGL4ES "$HOLYGL4ES_REF"
+          check_pin renderers/krypton_wrapper/krypton_wrapper "$KRYPTON_REF"
+          check_pin renderers/MobileGlues/MobileGlues "$MOBILEGLUES_REF"
+          check_pin renderers/mesa-libs/libs/kopper_zink/GLXShim "$GLXSHIM_REF"
+          git -C amethyst submodule update --init --recursive --depth 1 \
+            renderers/HolyGL4ES/HolyGL4ES \
+            renderers/krypton_wrapper/krypton_wrapper \
+            renderers/MobileGlues/MobileGlues \
+            renderers/mesa-libs/libs/kopper_zink/GLXShim
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '17'
-          distribution: 'temurin'
 
-      - name: Build LTW (upstream recipe)
-        working-directory: ltw-src
+      - name: Install the NDKs for GLXShim and libcutils
+        run: |
+          set -eu
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          # No pipefail here: `yes` always dies of SIGPIPE once sdkmanager stops reading.
+          yes | "$sdkmanager" --install "ndk;${GLXSHIM_NDK}" "ndk;${CUTILS_NDK}" > /dev/null
+          for ndk in "$GLXSHIM_NDK" "$CUTILS_NDK"; do
+            [ -f "$ANDROID_HOME/ndk/$ndk/build/cmake/android.toolchain.cmake" ] \
+              || { echo "::error::NDK $ndk didn't install"; exit 1; }
+          done
+
+      # Upstream's Gradle modules, untouched, with the NDK's own 16 KB switch added to every
+      # native build (cmake: ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES, ndk-build:
+      # APP_SUPPORT_FLEXIBLE_PAGE_SIZES — both NDK r27+).
+      - name: Turn on 16 KB pages for amethyst's native builds
+        run: |
+          cat >> amethyst/build.gradle <<'EOF'
+
+          // Added by nerion-android-renderer's renderer-unified.yml: link for 16 KB pages.
+          subprojects { sp ->
+              sp.plugins.withId('com.android.library') {
+                  sp.android.defaultConfig.externalNativeBuild.cmake.arguments("-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
+                  sp.android.defaultConfig.externalNativeBuild.ndkBuild.arguments("APP_SUPPORT_FLEXIBLE_PAGE_SIZES=true")
+              }
+          }
+          EOF
+
+      - name: Build HolyGL4ES, krypton_wrapper and MobileGlues (upstream recipe)
+        working-directory: amethyst
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon :ltw:assembleRelease
+          ./gradlew --no-daemon :HolyGL4ES:assembleRelease :krypton_wrapper:assembleRelease :MobileGlues:assembleRelease
 
-      - name: Fetch the v1 bundle and verify its sha256
+      - name: Build GLXShim (kopper-zink module's CMake project, AGP's defaults)
+        run: |
+          set -euo pipefail
+          ndk="$ANDROID_HOME/ndk/${GLXSHIM_NDK}"
+          cmake -S amethyst/renderers/mesa-libs/libs/kopper_zink/GLXShim/src/main/cpp -B build-glxshim -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" \
+            -DANDROID_ABI="$ABI" -DANDROID_PLATFORM=android-21 -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON
+          cmake --build build-glxshim
+
+      - name: Build libcutils (amethyst's build_libcutils.sh + 16 KB pages)
+        run: |
+          set -euo pipefail
+          dir=amethyst/renderers/mesa-libs/libs/kopper_zink/builddirs
+          sed -i "s| -llog\$| -llog ${PAGE_LDFLAG}|" "$dir/build_libcutils.sh"
+          grep -c -- "${PAGE_LDFLAG}" "$dir/build_libcutils.sh"
+          ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/${CUTILS_NDK}" bash "$dir/build_libcutils.sh"
+
+      - name: Collect the 5 libraries
+        run: |
+          set -euo pipefail
+          mkdir -p out aars
+          for aar in amethyst/build/outputs/aar/*-release.aar; do
+            echo "$aar:"; unzip -l "$aar" "jni/${ABI}/*" || true
+            unzip -o -j -q "$aar" "jni/${ABI}/*.so" -d aars || true
+          done
+          for lib in libgl4es_115.so libng_gl4es.so libmobileglues.so; do
+            cp -v "aars/$lib" out/
+          done
+          cp -v "$(find build-glxshim -name libglxshim.so | head -n1)" out/
+          cp -v "amethyst/renderers/mesa-libs/libs/kopper_zink/jniLibs/${ABI}/libcutils.so" out/
+          python3 scripts/check_page_align.py out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rebuilt-amethyst
+          path: out/
+
+  package:
+    name: Package unified bundle v3
+    needs: [mesa, amethyst]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Fetch the v2 bundle and verify its sha256
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -72,10 +321,23 @@ jobs:
           mkdir -p "bundle/$ABI"
           tar -xJf "base/$archive" -C "bundle/$ABI"
 
-      - name: Add libltw.so
+      - uses: actions/download-artifact@v4
+        with:
+          name: rebuilt-mesa
+          path: rebuilt
+      - uses: actions/download-artifact@v4
+        with:
+          name: rebuilt-amethyst
+          path: rebuilt
+
+      - name: Swap in the 7 rebuilt libraries
         run: |
           set -euo pipefail
-          unzip -j ltw-src/ltw/build/outputs/aar/ltw-release.aar "jni/${ABI}/libltw.so" -d "bundle/$ABI"
+          for lib in libEGL_mesa.so libzink_dri.so libgl4es_115.so libng_gl4es.so \
+                     libmobileglues.so libglxshim.so libcutils.so; do
+            [ -f "bundle/$ABI/$lib" ] || { echo "::error::v2 has no $lib to replace"; exit 1; }
+            cp -v "rebuilt/$lib" "bundle/$ABI/$lib"
+          done
           ls -la "bundle/$ABI"
 
       - name: Check the bundle is exactly the 13 expected libraries
@@ -86,6 +348,9 @@ jobs:
                     libopenal.so libvulkan_freedreno.so libzink_dri.so"
           diff <(echo $expected | tr ' ' '\n' | sort) <(ls "bundle/$ABI" | sort) \
             || { echo "::error::bundle/$ABI doesn't match the expected file list"; exit 1; }
+
+      - name: Check every library is aligned for 16 KB pages
+        run: python3 scripts/check_page_align.py "bundle/$ABI"
 
       - name: Archive + sha256
         run: |
@@ -120,17 +385,24 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           target_commitish: ${{ github.sha }}
-          name: "Unified Android Renderers v2 (+ LTW)"
+          name: "Unified Android Renderers v3 (16 KB pages)"
           body: |
-            Unified renderer bundle for arm64-v8a: everything in
-            `${{ env.BASE_TAG }}` (Zink Kopper, GL4ES/Krypton, ANGLE,
-            MobileGlues, Turnip Freedreno), unchanged, plus `libltw.so`.
+            Unified renderer bundle for arm64-v8a, every library aligned for
+            16 KB memory pages (required by Google Play).
 
-            `libltw.so` is LTW (Large Thin Wrapper), LGPL-3.0, built
-            unmodified from https://github.com/${{ env.LTW_REPO }}/tree/${{ env.LTW_REF }}
-            by `.github/workflows/renderer-unified.yml` (run ${{ github.run_id }}).
-            License text: `LICENSE-LGPL-3.0-ltw.txt` below. Provenance and
-            licensing notes: `vendor/ltw/README.md`.
+            Same renderers as `${{ env.BASE_TAG }}`. Rebuilt from the same
+            sources with only the page alignment changed:
+            - `libEGL_mesa.so`, `libzink_dri.so`: Mesa ${{ env.MESA_HOST }}/${{ env.MESA_REPO }}@${{ env.MESA_REF }}
+            - `libgl4es_115.so`: AngelAuraMC/HolyGL4ES@${{ env.HOLYGL4ES_REF }}
+            - `libng_gl4es.so`: BZLZHH/NG-GL4ES@${{ env.KRYPTON_REF }}
+            - `libmobileglues.so`: MobileGL-Dev/MobileGlues@${{ env.MOBILEGLUES_REF }}
+            - `libglxshim.so`: Swung0x48/GLXShim@${{ env.GLXSHIM_REF }}
+            - `libcutils.so`: AOSP libcutils (android-platform-13.0.0_r34), via ${{ env.AMETHYST_REPO }}@${{ env.AMETHYST_REF }}'s recipe
+
+            Unchanged from v2: ANGLE, Turnip Freedreno, glapi, OpenAL, LTW
+            (LGPL-3.0, `LICENSE-LGPL-3.0-ltw.txt` below).
+
+            Built by `.github/workflows/renderer-unified.yml` (run ${{ github.run_id }}).
           draft: false
           prerelease: false
           files: |
