@@ -228,9 +228,14 @@ jobs:
 
       - name: Install the NDKs for GLXShim and libcutils
         run: |
-          set -euo pipefail
+          set -eu
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          # No pipefail here: `yes` always dies of SIGPIPE once sdkmanager stops reading.
           yes | "$sdkmanager" --install "ndk;${GLXSHIM_NDK}" "ndk;${CUTILS_NDK}" > /dev/null
+          for ndk in "$GLXSHIM_NDK" "$CUTILS_NDK"; do
+            [ -f "$ANDROID_HOME/ndk/$ndk/build/cmake/android.toolchain.cmake" ] \
+              || { echo "::error::NDK $ndk didn't install"; exit 1; }
+          done
 
       # Upstream's Gradle modules, untouched, with the NDK's own 16 KB switch added to every
       # native build (cmake: ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES, ndk-build:
