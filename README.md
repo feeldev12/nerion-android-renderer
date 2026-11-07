@@ -33,3 +33,19 @@ from a pinned `MojoLauncher/LTW` commit (see `vendor/ltw/README.md`, LGPL-3.0).
   matrix covers all 4 ABIs for the self-built pair).
 - **First public Release is gated on task A2's licensing research for
   `libglxshim.so`** — see `vendor/angelauramc/README.md`. Not published yet.
+
+## License notices
+
+`notices/` holds the notices for every library in the unified bundle:
+`THIRD_PARTY_NOTICES.md` (project, source commit, license and copyright of each
+`.so`) and the full license texts it points to. `renderer-notices.yml` checks
+that each `.so` in the published bundle has its notice
+(`scripts/check_notices.py`) and, from `main`, attaches them to the bundle's
+Release as `renderer-notices.tar.xz` (+ `.sha256`). The launcher ships the same
+files in its APK (`assets/licenses/renderers/`).
+
+`vendor/angelauramc/LICENSE-MIT-mesa.txt` is a saved GitLab "404" page, not the
+Mesa license; `notices/LICENSE-Mesa.rst` is the real text (Mesa's
+`docs/license.rst` at the pinned commit). The vendor file is left as is because
+any change under `vendor/angelauramc/` re-runs `renderer-zink-kopper.yml`, which
+republishes its Release.

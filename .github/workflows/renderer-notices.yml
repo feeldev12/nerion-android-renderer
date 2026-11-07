@@ -1,0 +1,77 @@
+name: Renderer Notices
+
+# Publishes the license notices for the unified renderer bundle (notices/) as
+# `renderer-notices.tar.xz` (+ .sha256) on the bundle's own Release, next to
+# renderer-unified-<abi>.tar.xz. The bundle archive itself must hold only .so
+# files (the launcher extracts it straight into jniLibs/<abi>/), so the
+# notices travel as a separate asset.
+#
+# Every run checks that each .so in the published bundle is named in
+# notices/THIRD_PARTY_NOTICES.md and that every license file it points to
+# exists (scripts/check_notices.py). It doesn't rebuild or replace the bundle:
+# only the notices asset is added (or replaced) on RELEASE_TAG, and only from
+# main. Branch pushes just run the check.
+#
+# When renderer-unified.yml publishes a new bundle, bump RELEASE_TAG here too
+# and update notices/ for whatever changed.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/renderer-notices.yml'
+      - 'scripts/check_notices.py'
+      - 'notices/**'
+
+permissions:
+  contents: write
+
+env:
+  ABI: arm64-v8a
+  RELEASE_TAG: renderer-unified-v3
+
+jobs:
+  notices:
+    name: Check and publish renderer notices
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Fetch the published bundle and verify its sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="renderer-unified-${ABI}.tar.xz"
+          gh release download "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" -D base \
+            -p "$archive" -p "$archive.sha256"
+          expected=$(awk '{print $1}' "base/$archive.sha256")
+          actual=$(sha256sum "base/$archive" | awk '{print $1}')
+          [ "$expected" = "$actual" ] || { echo "::error::sha256 mismatch for $RELEASE_TAG/$archive"; exit 1; }
+          mkdir -p "bundle/$ABI"
+          tar -xJf "base/$archive" -C "bundle/$ABI"
+
+      - name: Check every library has its notice
+        run: python3 scripts/check_notices.py notices/THIRD_PARTY_NOTICES.md "bundle/$ABI"
+
+      - name: Archive + sha256
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -C notices -cJf dist/renderer-notices.tar.xz .
+          (cd dist && sha256sum renderer-notices.tar.xz > renderer-notices.tar.xz.sha256)
+          tar -tJf dist/renderer-notices.tar.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renderer-notices
+          path: dist/
+
+      - name: Attach to the bundle's Release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --clobber \
+            dist/renderer-notices.tar.xz dist/renderer-notices.tar.xz.sha256
